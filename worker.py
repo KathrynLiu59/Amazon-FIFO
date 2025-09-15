@@ -1,28 +1,33 @@
 # worker.py
-from db import run_sql, fetchdf
+from datetime import datetime
+from db import run_function, run_sql
 
-def rebuild_lot_costs():
-    run_sql("select rebuild_lot_costs();")
+def normalize_sales(ym: str):
+    run_function("normalize_sales_from_raw", ym)
 
-def build_sales_txn_for_month(ym: str):
-    run_sql("select build_sales_txn_for_month(%s);", (ym,))
+def rebuild_costs():
+    run_function("rebuild_lot_costs")
 
-def run_fifo_allocation(ym: str):
-    run_sql("select run_fifo_allocation(%s);", (ym,))
+def run_fifo(ym: str, marketplace: str | None = None):
+    run_function("run_fifo_allocation", ym, marketplace)
 
-def summarize_month(ym: str):
-    run_sql("select summarize_month(%s);", (ym,))
+def summarize(ym: str):
+    run_function("summarize_month", ym)
 
-def reverse_order(order_id: str):
-    run_sql("select apply_adjustment('REVERSE_ORDER', %s);", (order_id,))
+def run_all(ym: str, marketplace: str | None = None):
+    """
+    后端已提供 run_all(ym, marketplace)；这里优先调用后端一次跑完整。
+    若你想在前端逐步执行（方便定位），可以注释掉第一行，改为分步调用。
+    """
+    run_function("run_all", ym, marketplace)
+    # —— 分步替代（保留在此，便于调试）
+    # normalize_sales(ym)
+    # rebuild_costs()
+    # run_fifo(ym, marketplace)
+    # summarize(ym)
 
-def replay_order(order_id: str):
-    run_sql("select apply_adjustment('REPLAY_ORDER', %s);", (order_id,))
-
-def inventory_snapshot_df():
-    return fetchdf("""
-        select internal_sku, sum(qty_remaining) as qty_remaining
-        from lot_balance
-        group by internal_sku
-        order by internal_sku
-    """)
+def last_runs(limit: int = 20):
+    return run_sql(
+        "select * from run_history order by id desc limit %s",
+        (limit,)
+    )
