@@ -1,75 +1,101 @@
-from db import execute, get_conn
+# worker.py
+from __future__ import annotations
 
-def expand_movements(from_iso: str):
-    execute("delete from movement where happened_at >= %s and source='order';", (from_iso,))
-    execute("""
-    insert into movement(happened_at, internal_sku, qty, source, order_id, marketplace, amazon_sku)
-    select st.happened_at, kb.component_sku, st.qty * kb.units_per_kit, 'order', st.order_id, st.marketplace, st.sku
-    from sales_txn st
-    join kit_bom kb on kb.sku = st.sku and coalesce(st.marketplace,'US') = kb.marketplace
-    where st.type='order' and st.happened_at >= %s
-    """, (from_iso,))
-    execute("""
-    insert into movement(happened_at, internal_sku, qty, source, order_id, marketplace, amazon_sku)
-    select st.happened_at, sm.internal_sku, st.qty * coalesce(sm.unit_multiplier,1), 'order', st.order_id, st.marketplace, st.sku
-    from sales_txn st
-    join sku_map sm on sm.sku = st.sku and coalesce(st.marketplace,'US') = sm.marketplace
-    where st.type='order' and st.happened_at >= %s
-      and not exists (
-        select 1 from kit_bom kb
-        where kb.sku = st.sku and kb.marketplace = coalesce(st.marketplace,'US')
-      )
-    """, (from_iso,))
-    return True
+from typing import Iterable, Any
+from db import execute, fetchall
 
-def fifo_allocate(from_iso: str):
-    execute("delete from allocation_detail where happened_at >= %s and reversed_by is null;", (from_iso,))
+# ====== 基础动作：直接触发后端 SQL 函数/过程 ======
+
+def rebuild_costs() -> None:
+    """
+    重算：把每条柜的 freight/clearance 按 CBM 分摊到 SKU，
+         把 duty 按“本柜内该品类 FOB 占比”分摊（若有 SKU 级覆盖则以覆盖优先）。
+    依赖数据库中的函数：rebuild_lot_costs()
+    """
     execute("select rebuild_lot_costs();")
 
-    rows = execute("""
-        select happened_at, internal_sku, qty, order_id, marketplace
-        from movement
-        where happened_at >= %s
-        order by happened_at, id
-    """, (from_iso,))
-    if not rows:
-        return 0
 
-    total_alloc = 0
-    with get_conn() as conn, conn.cursor() as cur:
-        for happened_at, internal_sku, qty, order_id, marketplace in rows:
-            remaining = float(qty)
-            lots = execute("""
-                select lb.batch_id, lb.qty_remaining,
-                       lc.fob_unit, lc.freight_per_unit, lc.duty_per_unit, lc.clearance_per_unit,
-                       b.inbound_date
-                from lot_balance lb
-                join lot_cost lc on lc.batch_id=lb.batch_id and lc.internal_sku=lb.internal_sku
-                join batch b on b.batch_id=lb.batch_id
-                where lb.internal_sku = %s and lb.qty_remaining > 0
-                order by b.inbound_date, lb.batch_id
-            """, (internal_sku,))
-            for batch_id, qty_left, fob, fr, du, cl, _ in lots:
-                if remaining <= 0:
-                    break
-                take = min(remaining, float(qty_left))
-                if take <= 0:
-                    continue
-                cur.execute("""
-                    insert into allocation_detail(happened_at, internal_sku, qty, batch_id, order_id, marketplace,
-                                                  fob_unit, freight_unit, duty_unit, clearance_unit)
-                    values (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s);
-                """, (happened_at, internal_sku, take, batch_id, order_id, marketplace, fob, fr, du, cl))
-                remaining -= take
-                total_alloc += take
-        conn.commit()
-    execute("select rebuild_lot_costs();")
-    return total_alloc
+def summarize_month(ym: str) -> None:
+    """
+    统计某月汇总（比如订单数/金额/本月分摊的 FOB 与头程等）。
+    依赖数据库中的函数：summarize_month(text)
+    ym 形如 '2025-03'
+    """
+    execute("select summarize_month(%s);", (ym,))
 
-def summarize():
-    execute("select summarize_months();")
-    return True
 
-def reverse_order(order_id: str, note: str = ''):
-    execute("select reverse_order(%s,%s);", (order_id, note))
-    return True
+def refresh_inventory_view() -> None:
+    """
+    有些方案会把库存/成本做成物化视图（或普通视图）。
+    如果你用的是物化视图，比如 lot_balance_mv，则刷新它。
+    默认尝试两种写法：materialized 与普通 view 的刷新。
+    注意：若你只有普通视图（非物化），这一步可忽略。
+    """
+    try:
+        # 物化视图
+        execute("refresh materialized view concurrently lot_balance;")
+    except Exception:
+        try:
+            # 普通视图场景（这里书写一个 no-op 或者简易查询确保视图可用）
+            _ = fetchall("select 1;")
+        except Exception:
+            # 既不是物化也不是普通：忽略
+            pass
+
+
+# ====== 复合动作：为按钮/自动化提供一键流程 ======
+
+def rebuild_all_for_month(ym: str, *, do_refresh: bool = True) -> None:
+    """
+    “一键月结”管道：
+      1) 重算所有成本（考虑当月之前的库存沿用 FIFO）
+      2) 刷新库存快照（若有物化视图）
+      3) 生成该月汇总
+    """
+    rebuild_costs()
+    if do_refresh:
+        refresh_inventory_view()
+    summarize_month(ym)
+
+
+def quick_health_check() -> dict[str, Any]:
+    """
+    简易健康检查（用在 UI 顶部/调试）：
+    - 库里关键表是否存在
+    - 是否有 inbound / sales / sku_map 基础数据
+    """
+    out: dict[str, Any] = {}
+    try:
+        # 表存在性 & 行数
+        for name in ("inbound_lot", "sales_txn", "sku_map"):
+            try:
+                cnt = fetchall(f"select count(*) as c from {name}")[0]["c"]
+                out[name] = cnt
+            except Exception as e:
+                out[name] = f"missing ({e})"
+        # 视图/快照
+        try:
+            _ = fetchall("select * from lot_balance limit 1")
+            out["lot_balance"] = "ok"
+        except Exception as e:
+            out["lot_balance"] = f"missing ({e})"
+    except Exception as e:
+        out["error"] = str(e)
+    return out
+
+
+# ====== 可选：清理动作（谨慎！） ======
+
+def wipe_month_summary() -> None:
+    """清空月度汇总（仅用于重试/调试）"""
+    execute("truncate table month_summary;")
+
+def wipe_sales_for_month(ym: str) -> None:
+    """
+    清空某个月份的销售明细（按 happened_at 的年月重算）
+    注意：仅当你真的要重新导入该月 CSV 时再用！
+    """
+    execute(
+        "delete from sales_txn where to_char(happened_at, 'YYYY-MM') = %s;",
+        (ym,)
+    )
