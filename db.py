@@ -1,21 +1,37 @@
-# db.py  —— 统一的 Supabase 客户端
 import os
-from supabase import create_client, Client
+import psycopg2
+from psycopg2.extras import execute_values
+import streamlit as st
 
-def get_client() -> Client:
-    url = os.environ.get("SUPABASE_URL")
-    key = os.environ.get("SUPABASE_KEY")
-    if not url or not key:
-        raise RuntimeError("Missing SUPABASE_URL / SUPABASE_KEY in Secrets")
-    return create_client(url, key)
+@st.cache_resource(show_spinner=False)
+def get_conn():
+    dsn = st.secrets.get("POSTGRES_DSN")
+    if not dsn:
+        raise RuntimeError("Missing POSTGRES_DSN in Streamlit secrets")
+    return psycopg2.connect(dsn)
 
-def upsert(table: str, rows: list[dict], on_conflict: list[str] | None = None):
-    sb = get_client()
-    q = sb.table(table).upsert(rows)
-    if on_conflict:
-        q = q.on_conflict(",".join(on_conflict))
-    return q.execute()
+def fetch_df(sql, params=None):
+    import pandas as pd
+    with get_conn() as conn, conn.cursor() as cur:
+        cur.execute(sql, params or ())
+        cols = [d[0] for d in cur.description]
+        rows = cur.fetchall()
+    return pd.DataFrame(rows, columns=cols)
 
-def rpc(fn: str, args: dict | None = None):
-    sb = get_client()
-    return sb.rpc(fn, args or {}).execute()
+def exec_sql(sql, params=None):
+    with get_conn() as conn, conn.cursor() as cur:
+        cur.execute(sql, params or ())
+
+def bulk_upsert(table, cols, rows, conflict_cols):
+    if not rows:
+        return 0
+    col_list = ",".join(cols)
+    update_set = ",".join([f"{c}=EXCLUDED.{c}" for c in cols if c not in conflict_cols])
+    sql = f"""
+    insert into {table} ({col_list}) values %s
+    on conflict ({",".join(conflict_cols)}) do update
+    set {update_set};
+    """
+    with get_conn() as conn, conn.cursor() as cur:
+        execute_values(cur, sql, rows)
+    return len(rows)
