@@ -25,8 +25,9 @@ def df_insert(df: pd.DataFrame, table: str, truncate_first=False):
     if df.empty:
         return 0
     cols = list(df.columns)
-    values = [tuple(None if (pd.isna(row[c]) if not isinstance(row[c], (list, dict)) else False) else row[c]
-                    for c in cols) for _, row in df.iterrows()]
+    values = [tuple(
+        None if (pd.isna(row[c]) if not isinstance(row[c], (list, dict)) else False) else row[c]
+    ) for _, row in df.iterrows()]
     with get_conn() as conn, conn.cursor() as cur:
         if truncate_first:
             cur.execute(f"truncate table {table};")
@@ -40,8 +41,9 @@ def df_upsert(df: pd.DataFrame, table: str, conflict_cols: list[str]):
     cols = list(df.columns)
     with get_conn() as conn, conn.cursor() as cur:
         cur.execute("create temporary table _tmp_upsert as select * from " + table + " limit 0;")
-        rows = [tuple(None if (pd.isna(row[c]) if not isinstance(row[c], (list, dict)) else False) else row[c]
-                      for c in cols) for _, row in df.iterrows()]
+        rows = [tuple(
+            None if (pd.isna(row[c]) if not isinstance(row[c], (list, dict)) else False) else row[c]
+        ) for _, row in df.iterrows()]
         extras.execute_values(cur, "insert into _tmp_upsert(" + ", ".join(cols) + ") values %s", rows, page_size=1000)
         set_clause = ", ".join([f"{c}=excluded.{c}" for c in cols if c not in conflict_cols])
         conflict = ", ".join(conflict_cols)
