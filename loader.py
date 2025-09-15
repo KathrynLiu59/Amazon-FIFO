@@ -1,92 +1,109 @@
-import io
-import pandas as pd
-from db import execute
+# loader.py
+from typing import Iterable, Sequence
+import psycopg
+from db import get_conn
 
-def _read_amz_unified_bytes(file_bytes: bytes) -> pd.DataFrame:
-    """Robust reader: skip preface lines until header with 'date/time' appears; keep quotes; lower-case columns."""
-    try:
-        text = file_bytes.decode("utf-8")
-    except UnicodeDecodeError:
-        import chardet
-        enc = chardet.detect(file_bytes).get("encoding", "utf-8")
-        text = file_bytes.decode(enc, errors="ignore")
+# ============ 批量导入 ============
 
-    lines = text.splitlines()
-    hdr_idx = None
-    for i, line in enumerate(lines[:200]):
-        ll = line.lower()
-        if "date/time" in ll and "type" in ll and "order id" in ll:
-            hdr_idx = i
-            break
-    if hdr_idx is None:
-        raise ValueError("Cannot find header row (expecting 'date/time,type,order id,...').")
-
-    csv_text = "\n".join(lines[hdr_idx:])
-    df = pd.read_csv(io.StringIO(csv_text))
-    df.columns = [c.strip().lower() for c in df.columns]
-    return df
-
-def parse_paste(text: str) -> pd.DataFrame:
-    """Generic paste (used for inbound/tax)."""
-    if not text or not text.strip():
-        return pd.DataFrame()
-    first = text.splitlines()[0]
-    sep = "\t" if "\t" in first else ","
-    return pd.read_csv(io.StringIO(text), sep=sep)
-
-def import_sales_csv(file_bytes: bytes, tz: str = 'UTC') -> int:
-    """Import Amazon monthly unified transactions; keep Type=Order; normalize marketplace; de-dup by time range."""
-    df = _read_amz_unified_bytes(file_bytes)
-
-    required = ['type','order id','sku','quantity']
-    missing = [c for c in required if c not in df.columns]
-    if missing:
-        raise ValueError(f"CSV missing column(s): {', '.join(missing)}")
-
-    m_order = df['type'].astype(str).str.lower().str.contains(r'\border\b')
-    df = df[m_order].copy()
-    if df.empty:
+def insert_inbound_lot(rows: Sequence[tuple]) -> int:
+    """
+    rows: [(batch_id, internal_sku, category, qty_in, fob_unit, cbm_per_unit), ...]
+    发生冲突时以 batch_id+internal_sku 作为键进行 upsert。
+    """
+    if not rows:
         return 0
 
-    if 'date/time' in df.columns:
-        dt_series = df['date/time'].astype(str)
-    elif {'date','time'}.issubset(df.columns):
-        dt_series = df['date'].astype(str) + ' ' + df['time'].astype(str)
-    else:
-        raise ValueError("CSV must include 'date/time' or both 'date' and 'time'.")
+    sql = """
+    insert into inbound_lot
+        (batch_id, internal_sku, category, qty_in, fob_unit, cbm_per_unit)
+    values
+        (%s, %s, %s, %s, %s, %s)
+    on conflict (batch_id, internal_sku) do update set
+        category     = excluded.category,
+        qty_in       = excluded.qty_in,
+        fob_unit     = excluded.fob_unit,
+        cbm_per_unit = excluded.cbm_per_unit
+    """
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.executemany(sql, rows)
+            return cur.rowcount or 0
 
-    df['happened_at'] = pd.to_datetime(dt_series, errors='coerce', utc=True)
 
-    def norm_marketplace(s: str) -> str:
-        s = (s or "").strip().lower()
-        if "amazon.com" in s or s == "us": return "US"
-        if "amazon.co.uk" in s or s.endswith(".uk") or s == "uk": return "UK"
-        if "amazon.de" in s or s == "de": return "DE"
-        if "amazon.fr" in s or s == "fr": return "FR"
-        if "amazon.it" in s or s == "it": return "IT"
-        if "amazon.es" in s or s == "es": return "ES"
-        return s.upper() if s else "US"
+def upsert_duty_pool(rows: Sequence[tuple]) -> int:
+    """
+    rows: [(batch_id, category, duty_total), ...]
+    以 (batch_id, category) 为键
+    """
+    if not rows:
+        return 0
+    sql = """
+    insert into batch_duty_pool (batch_id, category, duty_total)
+    values (%s, %s, %s)
+    on conflict (batch_id, category) do update set
+      duty_total = excluded.duty_total
+    """
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.executemany(sql, rows)
+            return cur.rowcount or 0
 
-    if 'marketplace' in df.columns:
-        df['marketplace'] = df['marketplace'].astype(str).map(norm_marketplace)
-    else:
-        df['marketplace'] = 'US'
 
-    df['qty'] = pd.to_numeric(df['quantity'], errors='coerce').fillna(0)
+def upsert_entry_fees(rows: Sequence[tuple]) -> int:
+    """
+    rows: [(batch_id, freight_total, entryfees_total), ...]  一条记录一条柜的头程与清关合计
+    以 batch_id 为键
+    """
+    if not rows:
+        return 0
+    sql = """
+    insert into lot_cost (batch_id, freight_unit, duty_unit, clearance_unit, internal_sku)
+    values (%s, 0, 0, 0, '')  -- 仅占位；rebuild 时会重算并写入明细
+    on conflict (batch_id, internal_sku) do nothing
+    """
+    # 这里不真正存入费用，费用实际在 rebuild 函数内计算并写入。
+    # 但为了你现有架构不动太大，这个函数保留；若无需要可不调用。
+    return 0
 
-    out = df[['happened_at','type','order id','sku','marketplace','qty']].rename(columns={'order id':'order_id'})
 
-    start = out['happened_at'].min()
-    end = out['happened_at'].max() + pd.Timedelta(days=1)
-    execute("delete from sales_txn where happened_at >= %s and happened_at < %s;", (start, end))
+def insert_sales_txn(rows: Sequence[tuple]) -> int:
+    """
+    rows: [(happened_at, type, order_id, amazon_sku, qty, marketplace), ...]
+    只保留 type='Order' 的行（建议在上层过滤）
+    """
+    if not rows:
+        return 0
 
-    rows = list(out.itertuples(index=False, name=None))
-    from db import get_conn
-    import psycopg2.extras as extras
-    with get_conn() as conn, conn.cursor() as cur:
-        extras.execute_values(
-            cur,
-            "insert into sales_txn(happened_at,type,order_id,sku,marketplace,qty) values %s",
-            rows, page_size=1000
-        )
-    return len(rows)
+    sql = """
+    insert into sales_txn
+      (happened_at, type, order_id, amazon_sku, qty, marketplace)
+    values
+      (%s, %s, %s, %s, %s, %s)
+    on conflict do nothing
+    """
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.executemany(sql, rows)
+            return cur.rowcount or 0
+
+
+def upsert_sku_map(rows: Iterable[tuple]) -> int:
+    """
+    rows: [(amazon_sku, marketplace, internal_sku, unit_multiplier)]
+    允许“组合柜”：同一个 amazon_sku 可对应多条 internal_sku + multiplier
+    主键在建表时建议定义为 (amazon_sku, marketplace, internal_sku)
+    """
+    rows = list(rows)
+    if not rows:
+        return 0
+
+    sql = """
+    insert into sku_map (amazon_sku, marketplace, internal_sku, unit_multiplier)
+    values (%s, %s, %s, %s)
+    on conflict (amazon_sku, marketplace, internal_sku) do update set
+      unit_multiplier = excluded.unit_multiplier
+    """
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.executemany(sql, rows)
+            return cur.rowcount or 0
