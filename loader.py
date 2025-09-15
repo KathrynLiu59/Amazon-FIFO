@@ -1,6 +1,6 @@
 import io
 import pandas as pd
-from db import df_insert, execute
+from db import execute
 
 def parse_paste(text: str) -> pd.DataFrame:
     """Detect CSV or TSV from first line and parse to DataFrame."""
@@ -11,7 +11,10 @@ def parse_paste(text: str) -> pd.DataFrame:
     return pd.read_csv(io.StringIO(text), sep=sep)
 
 def import_sales_csv(file_bytes: bytes, tz: str = 'UTC'):
-    """Import Amazon sales CSV, keeping only type=Order rows."""
+    """
+    Import Amazon sales CSV, keeping only type=Order rows.
+    Inserts into sales_txn(happened_at,type,order_id,sku,marketplace,qty).
+    """
     df = pd.read_csv(io.BytesIO(file_bytes))
     df.columns = [c.strip().lower() for c in df.columns]
 
@@ -22,9 +25,11 @@ def import_sales_csv(file_bytes: bytes, tz: str = 'UTC'):
 
     if 'date/time' in df.columns:
         dtcol = 'date/time'
+        dt_series = df[dtcol].astype(str)
     elif 'date' in df.columns and 'time' in df.columns:
-        df['date/time'] = df['date'].astype(str) + ' ' + df['time'].astype_str()
         dtcol = 'date/time'
+        dt_series = df['date'].astype(str) + ' ' + df['time'].astype(str)
+        df[dtcol] = dt_series
     else:
         raise ValueError("CSV must include 'date/time' or 'date'+'time'.")
 
