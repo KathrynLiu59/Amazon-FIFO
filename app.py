@@ -94,14 +94,15 @@ with tabs[0]:
                         "FOB per Unit":"fob_unit",
                         "CBM per Unit":"cbm_per_unit",
                     })[["batch_id","inbound_date","internal_sku","category","qty_in","fob_unit","cbm_per_unit","freight_total","entryfees_total"]]
+                    # 仅入库建账：写 staging，调用后端过程构建 lot/成本；不触发月报
                     df_insert(out, "inbound_items_flat", truncate_first=True)
                     execute("select ingest_inbound_items();")
-                    st.success(f"Saved {len(out)} items and rebuilt costs.")
+                    st.success(f"Saved {len(out)} items and rebuilt per-unit costs.")
 
 # =============== Tax Upload ===============
 with tabs[1]:
     st.subheader("Tax / Duty by Batch")
-    st.caption("Fill category-level duty pool and optional per-SKU overrides, then Commit.")
+    st.caption("Fill category-level duty pool and optional per-SKU overrides, then Commit. (Does not trigger monthly report)")
     batch_for_tax = st.text_input("Batch ID for tax", placeholder="e.g., WF2305")
 
     st.markdown("**Category Duty Pool**  (columns: Category, Duty Total)")
@@ -128,7 +129,6 @@ with tabs[1]:
         if not batch_for_tax:
             st.error("Please input Batch ID.")
         else:
-            # write to inbound_tax_pool / inbound_tax_item and run ingest_inbound_tax()
             if not pool_df.empty:
                 p = pool_df.rename(columns={"Category":"category","Duty Total":"duty_total"})
                 p["batch_id"] = batch_for_tax
@@ -142,32 +142,53 @@ with tabs[1]:
             else:
                 execute("truncate table inbound_tax_item;")
             execute("select ingest_inbound_tax();")
-            st.success("Tax committed & costs rebuilt.")
+            st.success("Tax committed & per-unit costs rebuilt.")
 
-# =============== Sales Upload ===============
+# =============== Sales Upload (auto-process) ===============
 with tabs[2]:
     st.subheader("Amazon Sales")
     tz = st.text_input("Timezone", "UTC")
+    auto = st.checkbox("Auto-process after import (expand → FIFO → summarize for months in file)", value=True)
+
     colsu = st.columns(2)
     f = colsu[0].file_uploader("Upload CSV", type=["csv"], key="sales_csv")
     pasted = colsu[1].text_area("Or paste CSV/TSV (must include: date/time, type, order id, sku, quantity)", height=180, key="sales_paste")
 
     if st.button("Import Sales"):
         try:
+            import io
             if f:
-                n = import_sales_csv(f.read(), tz=tz)
+                raw_bytes = f.read()
+                n = import_sales_csv(raw_bytes, tz=tz)
+                # get df for date range
+                df_tmp = pd.read_csv(io.BytesIO(raw_bytes))
             else:
-                import io
                 buf = pasted or ""
                 if not buf.strip():
                     st.error("Please upload or paste data.")
                     st.stop()
-                temp_df = pd.read_csv(io.StringIO(buf))
-                tmp = io.BytesIO()
-                temp_df.to_csv(tmp, index=False)
-                tmp.seek(0)
+                df_tmp = pd.read_csv(io.StringIO(buf))
+                tmp = io.BytesIO(); df_tmp.to_csv(tmp, index=False); tmp.seek(0)
                 n = import_sales_csv(tmp.read(), tz=tz)
+
             st.success(f"Imported {n} order rows.")
+
+            if auto and n > 0:
+                # pick earliest month appearing in file
+                if 'date/time' in df_tmp.columns:
+                    mindt = pd.to_datetime(df_tmp['date/time'], errors='coerce', utc=True).min()
+                elif {'date','time'}.issubset(set(df_tmp.columns)):
+                    mindt = pd.to_datetime(df_tmp['date'].astype(str) + ' ' + df_tmp['time'].astype(str), errors='coerce', utc=True).min()
+                else:
+                    mindt = pd.Timestamp.utcnow()
+
+                month_start = pd.Timestamp(mindt.year, mindt.month, 1, tz='UTC').to_pydatetime().isoformat()
+
+                # 自动仅针对相关月份从月初处理：展开 → FIFO → 汇总
+                expand_movements(month_start)
+                qty = fifo_allocate(month_start)
+                summarize()
+                st.success(f"Auto-processed. FIFO allocated {qty} units. Monthly summary updated.")
         except Exception as e:
             st.error(str(e))
 
@@ -184,25 +205,50 @@ with tabs[3]:
     inv = pd.DataFrame(rows, columns=["SKU","Category","Qty Left"])
     st.dataframe(inv, use_container_width=True)
 
-# =============== Adjustments ===============
+# =============== Adjustments (auto reprocess month) ===============
 with tabs[4]:
     st.subheader("Reverse / Adjust by Order ID")
     oid = st.text_input("Order ID")
     note = st.text_input("Note (optional)")
+    auto_rev = st.checkbox("Auto-reprocess month after reverse", value=True)
+
     if st.button("Reverse Allocation"):
         try:
             reverse_order(oid, note)
-            st.success(f"Reversed {oid}. Then go to Reports to recompute.")
+            st.success(f"Reversed {oid}.")
+
+            if auto_rev and oid.strip():
+                # find order month
+                row = fetch_df(
+                    "select min(happened_at) as ts from sales_txn where order_id = %s;",
+                    params=(oid,), columns=["ts"]
+                )
+                if not row.empty and pd.notna(row.loc[0,"ts"]):
+                    ts = pd.to_datetime(row.loc[0,"ts"], utc=True)
+                else:
+                    row2 = fetch_df(
+                        "select min(happened_at) as ts from allocation_detail where order_id = %s;",
+                        params=(oid,), columns=["ts"]
+                    )
+                    ts = pd.to_datetime(row2.loc[0,"ts"], utc=True) if (not row2.empty and pd.notna(row2.loc[0,"ts"])) else pd.Timestamp.utcnow()
+
+                month_start = pd.Timestamp(ts.year, ts.month, 1, tz='UTC').to_pydatetime().isoformat()
+                expand_movements(month_start)
+                qty = fifo_allocate(month_start)
+                summarize()
+                st.success(f"Auto re-processed month {ts.strftime('%Y-%m')} after reverse. Allocated {qty} units.")
+            else:
+                st.info("Go to Reports if you want to manually reprocess.")
         except Exception as e:
             st.error(str(e))
 
-# =============== Reports ===============
+# =============== Reports (manual view) ===============
 with tabs[5]:
     st.subheader("Run / View Reports")
     d = st.date_input("Recompute From (choose the 1st of the month you are closing)", value=date(date.today().year, date.today().month, 1))
     iso = datetime.combine(d, datetime.min.time()).isoformat()
 
-    c1, c2, c3, c4 = st.columns(4)
+    c1, c2, c3 = st.columns(3)
     if c1.button("Expand Movements"):
         try:
             expand_movements(iso); st.success("Movements expanded.")
@@ -216,21 +262,6 @@ with tabs[5]:
     if c3.button("Summarize Month"):
         try:
             summarize(); st.success("Summary updated.")
-        except Exception as e:
-            st.error(str(e))
-    if c4.button("Save Monthly Snapshot"):
-        try:
-            # simple snapshot table for month_summary
-            execute("""
-            create table if not exists month_summary_snapshot (
-                snapshot_time timestamptz default now(),
-                month date,
-                fob numeric, freight numeric, duty numeric, clearance numeric, headhaul numeric, orders integer
-            );
-            insert into month_summary_snapshot(month, fob, freight, duty, clearance, headhaul, orders)
-            select month, fob, freight, duty, clearance, headhaul, orders from month_summary;
-            """)
-            st.success("Snapshot saved.")
         except Exception as e:
             st.error(str(e))
 
