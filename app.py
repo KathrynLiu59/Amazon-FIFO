@@ -13,37 +13,77 @@
 import os
 import io
 import json
+import urllib.parse as _url
 import pandas as pd
 import streamlit as st
 
 # ---- DB helpers (psycopg v3) ----
 try:
     import psycopg
-except Exception as e:
-    st.error("psycopg is not installed correctly. Please ensure requirements.txt has `psycopg[binary]==3.1.19` "
-             "and runtime.txt is python-3.11.9")
+except Exception:
+    st.error(
+        "psycopg is not installed correctly. Please ensure requirements.txt has "
+        "`psycopg[binary]==3.1.19` and runtime.txt is python-3.11.9"
+    )
     st.stop()
+
+
+def _normalize_dsn(dsn: str) -> str:
+    """
+    Make Supabase DSN safe for psycopg3:
+      - remove unsupported URI query params (e.g. prepare_threshold)
+      - ensure sslmode=require exists
+    Works for both URI and key/value DSN.
+    """
+    dsn = dsn.strip()
+
+    # Key/value style (host=... port=... dbname=...):
+    if "://" not in dsn and "host=" in dsn:
+        # ensure sslmode=require
+        if "sslmode=" not in dsn:
+            dsn += " sslmode=require"
+        # remove prepare_threshold if present
+        parts = dsn.split()
+        parts = [p for p in parts if not p.startswith("prepare_threshold=")]
+        return " ".join(parts)
+
+    # URI style
+    if "://" in dsn:
+        parsed = _url.urlsplit(dsn)
+        q = _url.parse_qs(parsed.query, keep_blank_values=True)
+
+        # drop unsupported params
+        q.pop("prepare_threshold", None)
+
+        # ensure sslmode=require
+        if "sslmode" not in q:
+            q["sslmode"] = ["require"]
+
+        new_query = _url.urlencode(q, doseq=True)
+        dsn = _url.urlunsplit((parsed.scheme, parsed.netloc, parsed.path, new_query, parsed.fragment))
+        return dsn
+
+    return dsn
 
 
 @st.cache_resource(show_spinner=False)
 def get_conn():
     """
     Prefer a single DSN via secrets:
-      st.secrets["DB_DSN"]  # Supabase 'Direct connection' string (postgres://...)
+      st.secrets["DB_DSN"]  # Supabase 'Transaction pooler' or 'Direct' string
     Fallback to env var DB_DSN.
     """
-    dsn = None
-    if "DB_DSN" in st.secrets:
-        dsn = st.secrets["DB_DSN"]
-    elif os.environ.get("DB_DSN"):
-        dsn = os.environ["DB_DSN"]
-
+    dsn = st.secrets.get("DB_DSN") or os.environ.get("DB_DSN")
     if not dsn:
-        st.error("Missing DB_DSN. Please paste your Supabase 'Direct connection' string into "
-                 "Streamlit → Settings → Secrets as DB_DSN.")
+        st.error(
+            "Missing DB_DSN. Please paste your Supabase connection string into "
+            "Streamlit → Settings → Secrets as DB_DSN."
+        )
         st.stop()
 
-    return psycopg.connect(dsn, autocommit=True)
+    safe_dsn = _normalize_dsn(dsn)
+    # Critical: disable prepared statements in code to work with pooler
+    return psycopg.connect(safe_dsn, autocommit=True, prepare_threshold=None)
 
 
 def fetch_df(sql: str, params: tuple | None = None) -> pd.DataFrame:
@@ -243,7 +283,6 @@ def page_inbound():
 
     with colB:
         if st.button("Rebuild Costs & Inventory", use_container_width=True):
-            # 分摊成本 + 刷新余额
             exec_sql("select rebuild_lot_costs();")
             exec_sql("select rebuild_lot_balance();")
             st.success("Costs and lot balance rebuilt.")
@@ -261,9 +300,6 @@ def page_sales_upload():
         except Exception:
             raw = pd.read_csv(file, encoding="utf-8", engine="python")
 
-        # 这里做一个最小映射（示例：你们导出的列名请按需调整）
-        # 目标列：ym, date_time, marketplace, order_id, amazon_sku, qty
-        # —— 若你的样例文件列名不同，请告诉我；我再按你的模板改对应字段。
         cols = raw.columns.str.lower()
         raw.columns = cols
 
@@ -282,7 +318,7 @@ def page_sales_upload():
             "qty": pd.to_numeric(pick("quantity", "quantity-purchased", "qty", default=0), errors="coerce").fillna(0).astype(int)
         })
 
-        df = df.dropna(subset=["date_time", "order_id", "amazon_sku"])  # 基本清洗
+        df = df.dropna(subset=["date_time", "order_id", "amazon_sku"])
         rows = [tuple(x) for x in df[["ym","date_time","marketplace","order_id","amazon_sku","qty"]].values.tolist()]
         exec_many("""
             insert into sales_raw(ym, date_time, marketplace, order_id, amazon_sku, qty)
