@@ -1,9 +1,7 @@
 from db import execute, get_conn
 
 def expand_movements(from_iso: str):
-    # rebuild movements for orders from from_iso forward
     execute("delete from movement where happened_at >= %s and source='order';", (from_iso,))
-    # kit (BOM) expansion
     execute("""
     insert into movement(happened_at, internal_sku, qty, source, order_id, marketplace, amazon_sku)
     select st.happened_at, kb.component_sku, st.qty * kb.units_per_kit, 'order', st.order_id, st.marketplace, st.sku
@@ -11,7 +9,6 @@ def expand_movements(from_iso: str):
     join kit_bom kb on kb.sku = st.sku and coalesce(st.marketplace,'US') = kb.marketplace
     where st.type='order' and st.happened_at >= %s
     """, (from_iso,))
-    # simple sku_map expansion (when not a kit)
     execute("""
     insert into movement(happened_at, internal_sku, qty, source, order_id, marketplace, amazon_sku)
     select st.happened_at, sm.internal_sku, st.qty * coalesce(sm.unit_multiplier,1), 'order', st.order_id, st.marketplace, st.sku
@@ -26,9 +23,8 @@ def expand_movements(from_iso: str):
     return True
 
 def fifo_allocate(from_iso: str):
-    # clear allocations from that point
     execute("delete from allocation_detail where happened_at >= %s and reversed_by is null;", (from_iso,))
-    execute("select rebuild_lot_costs();")  # ensure per-unit costs are fresh
+    execute("select rebuild_lot_costs();")
 
     rows = execute("""
         select happened_at, internal_sku, qty, order_id, marketplace
