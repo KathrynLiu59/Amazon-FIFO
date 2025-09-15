@@ -1,228 +1,230 @@
 # app.py
-import io
-import os
-import datetime as dt
+import io, os, datetime as dt
 import pandas as pd
 import streamlit as st
 
-import psycopg  # 需要以 psycopg 3 方式使用
-from db import fetchall
-from loader import (
-    insert_inbound_lot,
-    upsert_duty_pool,
-    insert_sales_txn,
-    upsert_sku_map,
+from db import fetchdf, run_sql
+from loader import csv_to_df, parse_amz_unified_csv, upsert_df
+from worker import (
+    rebuild_lot_costs, build_sales_txn_for_month, run_fifo_allocation,
+    summarize_month, reverse_order, replay_order, inventory_snapshot_df
 )
-from worker import rebuild_costs, summarize_month
 
 st.set_page_config(page_title="Amazon FIFO Cost Portal", layout="wide")
-
 st.title("Amazon FIFO Cost Portal")
 
-tabs = st.tabs([
-    "Inbound (柜次入库)",
-    "Sales Upload (月度明细)",
-    "SKU Map (组合/映射)",
-    "Inventory (库存&成本)",
-    "Summaries (月度汇总)"
-])
+# ============ 工具 ============
+def _note_ok(msg): st.success(msg, icon="✅")
+def _note_err(msg): st.error(msg, icon="❌")
 
-# ===================== 1) Inbound =====================
+# ============ 侧边栏 ============
+st.sidebar.header("Quick Actions")
+with st.sidebar:
+    ym = st.text_input("Target Month (YYYY-MM)", value=dt.date.today().strftime("%Y-%m"))
+    marketplace = st.selectbox("Marketplace", ["US", "EU"], index=0)
+
+tabs = st.tabs(["📦 Inbound (New Container)", "🧾 Sales Upload", "⚙️ Run Month",
+                "📊 Inventory", "📜 History / Adjustments", "🛠 Settings"])
+
+# ============ Tab 1: 入库（新柜） ============
 with tabs[0]:
-    st.subheader("Inbound – paste items for a batch")
-
-    c1, c2, c3 = st.columns([2,1,1])
-    with c1:
-        batch_id = st.text_input("Batch ID", placeholder="例如 WF2306")
-    with c2:
-        ship_date = st.date_input("Ship/Arrive Date", dt.date.today())
-    with c3:
-        st.caption("费用录入见表格右侧说明")
-
-    st.markdown("**Paste items below** (columns: `internal_sku, category, qty_in, fob_unit, cbm_per_unit`)")
-
-    inbound_df = st.data_editor(
-        pd.DataFrame(columns=["internal_sku","category","qty_in","fob_unit","cbm_per_unit"]),
-        num_rows="dynamic",
-        use_container_width=True,
-        key="inbound_editor",
-        height=300
-    )
-
-    st.write("**Duty by Category for this batch (optional):**")
-    duty_df = st.data_editor(
-        pd.DataFrame(columns=["category","duty_total"]),
-        num_rows="dynamic",
-        use_container_width=True,
-        key="duty_editor",
-        height=180
-    )
-
-    commit = st.button("Commit Inbound")
-    if commit:
-        if not batch_id:
-            st.error("Batch ID is required.")
-        else:
-            # 过滤空行并构造 rows
-            idf = inbound_df.dropna(how="all")
-            idf = idf[idf["internal_sku"].astype(str).str.len() > 0]
-            rows = []
-            for _, r in idf.iterrows():
-                try:
-                    rows.append((
-                        batch_id,
-                        str(r["internal_sku"]).strip(),
-                        str(r.get("category","")).strip(),
-                        float(r.get("qty_in",0) or 0),
-                        float(r.get("fob_unit",0) or 0),
-                        float(r.get("cbm_per_unit",0) or 0),
-                    ))
-                except Exception as e:
-                    st.error(f"Row parse error: {e}")
-                    rows = []
-                    break
-            n1 = insert_inbound_lot(rows) if rows else 0
-
-            ddf = duty_df.dropna(how="all")
-            ddf = ddf[ddf["category"].astype(str).str.len() > 0]
-            duty_rows = []
-            for _, r in ddf.iterrows():
-                duty_rows.append((batch_id, str(r["category"]).strip(), float(r.get("duty_total",0) or 0)))
-            n2 = upsert_duty_pool(duty_rows) if duty_rows else 0
-
-            # 重算成本（将 freight/entry 按 CBM、duty 按 FOB 占比分摊到 SKU）
+    st.subheader("Create/Update Container (Batch) & Items, Taxes")
+    col1, col2 = st.columns([1,1])
+    with col1:
+        st.markdown("**1) Batch header**  (sheet: `batch`)")
+        batch_df = st.data_editor(
+            pd.DataFrame([{
+                "batch_id": "",
+                "received_at": dt.date.today().isoformat(),
+                "marketplace": marketplace,
+                "freight_total": 0,
+                "entryfees_total": 0,
+                "note": ""
+            }]),
+            key="batch_edit", use_container_width=True, num_rows="dynamic"
+        )
+        if st.button("Commit Batch"):
             try:
-                rebuild_costs()
+                upsert_df("batch", batch_df, ["batch_id"])
+                _note_ok("Batch upserted.")
             except Exception as e:
-                st.warning(f"rebuild_lot_costs() failed (you can still run it later): {e}")
+                _note_err(str(e))
 
-            st.success(f"Inbound committed: items={n1}, duty_rows={n2}.")
+    with col2:
+        st.markdown("**2) Batch items** (sheet: `inbound_lot`)")
+        items_df = st.data_editor(
+            pd.DataFrame([{
+                "batch_id": "",
+                "internal_sku": "",
+                "qty_in": 0,
+                "fob_unit": 0,
+                "cbm_per_unit": 0,
+                "category": ""
+            }]),
+            key="items_edit", use_container_width=True, num_rows="dynamic"
+        )
+        if st.button("Commit Items"):
+            try:
+                upsert_df("inbound_lot", items_df, ["batch_id","internal_sku"])
+                _note_ok("Inbound items upserted.")
+            except Exception as e:
+                _note_err(str(e))
 
-# ===================== 2) Sales Upload =====================
+    st.markdown("---")
+    col3, col4 = st.columns([1,1])
+    with col3:
+        st.markdown("**3) Duty by Category (pool)** (sheet: `inbound_tax_pool`)")
+        tax_pool_df = st.data_editor(
+            pd.DataFrame([{
+                "batch_id": "",
+                "category": "",
+                "duty_total": 0
+            }]),
+            key="tax_pool_edit", use_container_width=True, num_rows="dynamic"
+        )
+        if st.button("Commit Duty Pool"):
+            try:
+                upsert_df("inbound_tax_pool", tax_pool_df, ["batch_id","category"])
+                _note_ok("Duty pool upserted.")
+            except Exception as e:
+                _note_err(str(e))
+    with col4:
+        st.markdown("**4) Duty override by item (optional)** (sheet: `inbound_tax_override`)")
+        tax_item_df = st.data_editor(
+            pd.DataFrame([{
+                "batch_id": "",
+                "internal_sku": "",
+                "duty_amount": 0
+            }]),
+            key="tax_item_edit", use_container_width=True, num_rows="dynamic"
+        )
+        if st.button("Commit Duty Override"):
+            try:
+                upsert_df("inbound_tax_override", tax_item_df, ["batch_id","internal_sku"])
+                _note_ok("Duty item override upserted.")
+            except Exception as e:
+                _note_err(str(e))
+
+    st.markdown("---")
+    if st.button("Rebuild Lot Costs (allocate freight/duty/entry)"):
+        try:
+            rebuild_lot_costs()
+            _note_ok("Lot costs rebuilt.")
+        except Exception as e:
+            _note_err(str(e))
+
+# ============ Tab 2: 销售上传 ============
 with tabs[1]:
-    st.subheader("Sales Upload – paste Amazon monthly CSV (Orders only)")
+    st.subheader("Upload Amazon Monthly 'All Transactions' CSV")
+    up_file = st.file_uploader("Upload CSV", type=["csv"])
+    if up_file:
+        try:
+            raw = csv_to_df(up_file)
+            st.caption(f"Raw rows: {len(raw)}")
+            parsed = parse_amz_unified_csv(raw, ym=ym, marketplace=marketplace)
+            st.dataframe(parsed.head(20), use_container_width=True)
+            if st.button("Commit to sales_raw"):
+                upsert_df("sales_raw", parsed, ["ym","marketplace","date_time","order_id","sku"])
+                _note_ok("sales_raw imported.")
+        except Exception as e:
+            _note_err(str(e))
 
-    st.caption("最低需要列: `date/time, type, order id, sku, quantity, marketplace`（你的导出名可能略有不同，下方有字段映射）。")
-
-    file = st.file_uploader("Upload CSV", type=["csv"])
-    if file:
-        raw = pd.read_csv(file)
-        st.write("Preview", raw.head())
-
-        # 字段映射（按你的 Amazon 导出名称做默认，必要时可以改动）
-        mapping = {
-            "date/time": "happened_at",
-            "type": "type",
-            "order id": "order_id",
-            "sku": "amazon_sku",
-            "quantity": "qty",
-            "marketplace": "marketplace",
-        }
-        # 容错：尝试大小写、空格等
-        def find_col(df, target):
-            for c in df.columns:
-                if c.strip().lower() == target:
-                    return c
-            return None
-
-        colmap = {}
-        for src, dst in mapping.items():
-            col = find_col(raw, src)
-            if not col:
-                st.error(f"CSV 缺少列: {src}")
-            colmap[dst] = col
-
-        ok = all(colmap.values())
-        if ok:
-            # 保留 type='order'
-            df = raw.copy()
-            df["__type_lower__"] = df[colmap["type"]].astype(str).str.lower()
-            df = df[df["__type_lower__"] == "order"]
-            # 构造 rows
-            rows = []
-            for _, r in df.iterrows():
-                try:
-                    happened = pd.to_datetime(r[colmap["happened_at"]], errors="coerce")
-                    if pd.isna(happened):
-                        continue
-                    rows.append((
-                        happened.to_pydatetime(),
-                        "Order",
-                        str(r[colmap["order_id"]]),
-                        str(r[colmap["amazon_sku"]]),
-                        float(r[colmap["qty"]] or 0),
-                        str(r[colmap["marketplace"]]).upper().strip(),
-                    ))
-                except Exception as e:
-                    st.warning(f"skip a row: {e}")
-            if rows:
-                n = insert_sales_txn(rows)
-                st.success(f"Inserted order rows: {n}")
-            else:
-                st.info("没有可导入的订单行。")
-
-# ===================== 3) SKU Map =====================
+# ============ Tab 3: 跑当月 ============
 with tabs[2]:
-    st.subheader("SKU Map – support kits / multi-mapping")
-
-    st.markdown("为组合柜或命名不一致建立映射。可多行同一 AmazonSKU → 多个 InternalSKU + UnitMultiplier。")
-    map_df = st.data_editor(
-        pd.DataFrame(columns=["amazon_sku","marketplace","internal_sku","unit_multiplier"]),
-        num_rows="dynamic",
-        use_container_width=True,
-        height=260,
-        key="map_editor"
-    )
-    if st.button("Upsert Mapping"):
-        mdf = map_df.dropna(how="all")
-        mdf = mdf[mdf["amazon_sku"].astype(str).str.len() > 0]
-        rows = []
-        for _, r in mdf.iterrows():
-            rows.append((
-                str(r["amazon_sku"]).strip(),
-                str(r.get("marketplace","US")).upper().strip() or "US",
-                str(r["internal_sku"]).strip(),
-                float(r.get("unit_multiplier",1) or 1),
-            ))
-        n = upsert_sku_map(rows) if rows else 0
-        st.success(f"Upserted map rows: {n}")
-
-# ===================== 4) Inventory =====================
-with tabs[3]:
-    st.subheader("Inventory & Cost (lot balance snapshot)")
-    q = """
-    select internal_sku, qty_on_hand, avg_fob_unit, avg_freight_unit, avg_duty_unit, avg_clearance_unit
-    from lot_balance
-    order by internal_sku
-    """
-    try:
-        inv = fetchall(q)
-        st.dataframe(pd.DataFrame(inv), use_container_width=True, height=380)
-    except Exception as e:
-        st.warning(f"Query lot_balance failed (did you create views/functions?): {e}")
-
-# ===================== 5) Summary =====================
-with tabs[4]:
-    st.subheader("Monthly summary")
-    ym = st.text_input("Year-Month (YYYY-MM)", (dt.date.today().replace(day=1) - dt.timedelta(days=1)).strftime("%Y-%m"))
-    c1, c2 = st.columns([1,1])
+    st.subheader("Build sales_txn → FIFO allocate → Month summary")
+    c1, c2, c3 = st.columns(3)
     with c1:
-        if st.button("Rebuild Costs Now"):
+        if st.button("1) Build sales_txn for month"):
             try:
-                rebuild_costs()
-                st.success("rebuild_lot_costs() done.")
+                build_sales_txn_for_month(ym)
+                _note_ok("sales_txn built from sales_raw.")
             except Exception as e:
-                st.error(f"Rebuild failed: {e}")
+                _note_err(str(e))
     with c2:
-        if st.button("Summarize Month"):
+        if st.button("2) Run FIFO allocation"):
+            try:
+                run_fifo_allocation(ym)
+                _note_ok("FIFO allocation done.")
+            except Exception as e:
+                _note_err(str(e))
+    with c3:
+        if st.button("3) Summarize month"):
             try:
                 summarize_month(ym)
-                st.success(f"summarize_month({ym}) done.")
+                _note_ok("Month summarized.")
             except Exception as e:
-                st.error(f"Summarize failed: {e}")
+                _note_err(str(e))
 
-    try:
-        ms = fetchall("select * from month_summary order by ym desc limit 24")
-        st.dataframe(pd.DataFrame(ms), use_container_width=True, height=360)
-    except Exception as e:
-        st.info(f"No month_summary yet or view missing: {e}")
+    st.markdown("#### Month summary (history)")
+    ms = fetchdf("select * from month_summary order by ym desc limit 24")
+    st.dataframe(ms, use_container_width=True)
+
+# ============ Tab 4: 库存 ============
+with tabs[3]:
+    st.subheader("Inventory Snapshot & Threshold")
+    inv = inventory_snapshot_df()
+    st.dataframe(inv, use_container_width=True)
+    st.markdown("**Threshold editing** (sheet: `inventory_threshold`)")
+    cur = fetchdf("select * from inventory_threshold")
+    cur = cur if not cur.empty else pd.DataFrame([{"internal_sku":"","warn_qty":0}])
+    edited = st.data_editor(cur, num_rows="dynamic", use_container_width=True, key="warn_edit")
+    if st.button("Save Threshold"):
+        try:
+            upsert_df("inventory_threshold", edited, ["internal_sku"])
+            _note_ok("Threshold saved.")
+        except Exception as e:
+            _note_err(str(e))
+
+# ============ Tab 5: 历史/调整 ============
+with tabs[4]:
+    st.subheader("Reverse or Replay an Order")
+    oid = st.text_input("Order ID")
+    c1, c2 = st.columns(2)
+    with c1:
+        if st.button("Reverse Order"):
+            try:
+                reverse_order(oid)
+                _note_ok("Order reversed.")
+            except Exception as e:
+                _note_err(str(e))
+    with c2:
+        if st.button("Replay Order"):
+            try:
+                replay_order(oid)
+                _note_ok("Order replayed.")
+            except Exception as e:
+                _note_err(str(e))
+
+    st.markdown("#### Recent adjustments")
+    ad = fetchdf("select * from adjustments order by created_at desc limit 50")
+    st.dataframe(ad, use_container_width=True)
+
+# ============ Tab 6: Settings ============
+with tabs[5]:
+    st.subheader("Mappings")
+    st.caption("**SKU Map** (Amazon SKU → Internal SKU)")
+    m = fetchdf("select * from sku_map order by amazonsku")
+    m = m if not m.empty else pd.DataFrame([{
+        "amazonsku":"", "marketplace": marketplace, "internal_sku":"", "unit_multiplier":1
+    }])
+    m2 = st.data_editor(m, num_rows="dynamic", use_container_width=True, key="sku_map_edit")
+    if st.button("Save SKU Map"):
+        try:
+            upsert_df("sku_map", m2, ["amazonsku","marketplace","internal_sku"])
+            _note_ok("SKU map saved.")
+        except Exception as e:
+            _note_err(str(e))
+
+    st.divider()
+    st.caption("**Kit / BOM** (Amazon kit SKU → internal sku components)")
+    kb = fetchdf("select * from kit_bom order by amazonsku")
+    kb = kb if not kb.empty else pd.DataFrame([{
+        "amazonsku":"", "marketplace": marketplace, "internal_sku":"", "qty":1
+    }])
+    kb2 = st.data_editor(kb, num_rows="dynamic", use_container_width=True, key="kit_bom_edit")
+    if st.button("Save Kit/BOM"):
+        try:
+            upsert_df("kit_bom", kb2, ["amazonsku","marketplace","internal_sku"])
+            _note_ok("Kit/BOM saved.")
+        except Exception as e:
+            _note_err(str(e))
