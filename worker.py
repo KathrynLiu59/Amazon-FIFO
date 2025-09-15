@@ -31,7 +31,7 @@ def fifo_allocate(from_iso: str):
     execute("select rebuild_lot_costs();")  # ensure per-unit costs are fresh
 
     rows = execute("""
-        select happened_at, internal_sku, qty, order_id
+        select happened_at, internal_sku, qty, order_id, marketplace
         from movement
         where happened_at >= %s
         order by happened_at, id
@@ -41,7 +41,7 @@ def fifo_allocate(from_iso: str):
 
     total_alloc = 0
     with get_conn() as conn, conn.cursor() as cur:
-        for happened_at, internal_sku, qty, order_id in rows:
+        for happened_at, internal_sku, qty, order_id, marketplace in rows:
             remaining = float(qty)
             lots = execute("""
                 select lb.batch_id, lb.qty_remaining,
@@ -60,10 +60,10 @@ def fifo_allocate(from_iso: str):
                 if take <= 0:
                     continue
                 cur.execute("""
-                    insert into allocation_detail(happened_at, internal_sku, qty, batch_id, order_id,
+                    insert into allocation_detail(happened_at, internal_sku, qty, batch_id, order_id, marketplace,
                                                   fob_unit, freight_unit, duty_unit, clearance_unit)
-                    values (%s,%s,%s,%s,%s,%s,%s,%s,%s);
-                """, (happened_at, internal_sku, take, batch_id, order_id, fob, fr, du, cl))
+                    values (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s);
+                """, (happened_at, internal_sku, take, batch_id, order_id, marketplace, fob, fr, du, cl))
                 remaining -= take
                 total_alloc += take
         conn.commit()
