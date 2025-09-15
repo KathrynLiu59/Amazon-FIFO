@@ -1,148 +1,120 @@
-# app.py — Streamlit 入口
+# app.py —— 多标签操作台（简洁但功能齐全）
 import streamlit as st
 import pandas as pd
-from db import get_conn
-from loader import load_sales_raw_from_csv
-from worker import run_all, last_runs
+from datetime import datetime
+from db import rpc
+from loader import (
+    load_sales_raw_from_csv, upsert_batch, upsert_inbound_items,
+    upsert_batch_cost_pool, upsert_batch_duty_pool,
+    upsert_category, upsert_products, upsert_sku_map, upsert_kit_bom
+)
 
-st.set_page_config(page_title="Amazon FIFO | Cost Portal", layout="wide")
+st.set_page_config(page_title="Amazon FIFO Portal", layout="wide")
+st.title("Amazon FIFO • Inventory & Costing")
 
-st.title("Amazon FIFO Cost Portal")
+tabs = st.tabs(["Inbound","Sales","Inventory","Summary","Mapping"])
 
-tab_in, tab_sales, tab_close, tab_inv, tab_logs = st.tabs([
-    "Inbound & Costs", "Sales Upload", "Month Close", "Inventory", "Logs"
-])
+# -------- Inbound --------
+with tabs[0]:
+    st.subheader("New Batch & Cost Pools")
+    c1,c2 = st.columns(2)
+    with c1:
+        st.markdown("**Batches**")
+        df_b = st.data_editor(pd.DataFrame([{
+            "batch_id":"", "container_no":"", "arrived_at":datetime.today().date(),
+            "dest_market":"US", "note":""
+        }]), num_rows="dynamic", use_container_width=True)
+        if st.button("Save Batches"):
+            upsert_batch(df_b.fillna("").to_dict("records"))
+            st.success("Batches saved")
 
-with tab_in:
-    st.subheader("1) Record inbound lots / costs")
+        st.markdown("**Inbound Items**")
+        df_i = st.data_editor(pd.DataFrame([{
+            "batch_id":"", "internal_sku":"", "category":"", "qty_in":0,
+            "fob_unit":0, "cbm_per_unit":0, "weight_kg_per_unit":0, "duty_override_unit":None
+        }]), num_rows="dynamic", use_container_width=True)
+        if st.button("Save Inbound Items"):
+            upsert_inbound_items(df_i.fillna("").to_dict("records"))
+            st.success("Inbound items saved")
 
-    st.markdown("**Inbound Lot (Header)**")
-    col1, col2, col3, col4 = st.columns(4)
-    with col1:
-        batch_id = st.text_input("Batch ID *")
-    with col2:
-        inbound_date = st.date_input("Inbound Date *")
-    with col3:
-        marketplace = st.selectbox("Marketplace *", ["US", "EU", "JP"], index=0)
-    with col4:
-        container_no = st.text_input("Container #", "")
+    with c2:
+        st.markdown("**Freight & Clearance Pools**")
+        df_f = st.data_editor(pd.DataFrame([{
+            "batch_id":"", "freight_total":0, "clearance_total":0
+        }]), num_rows="dynamic", use_container_width=True)
+        if st.button("Save Freight/Clearance"):
+            upsert_batch_cost_pool(df_f.fillna(0).to_dict("records"))
+            st.success("Cost pool saved")
 
-    if st.button("Upsert Lot Header"):
-        with get_conn() as conn, conn.cursor() as cur:
-            cur.execute("""
-              insert into inbound_lot(batch_id, inbound_date, marketplace, container_no)
-              values (%s,%s,%s,%s)
-              on conflict (batch_id, marketplace) do update
-                set inbound_date=excluded.inbound_date,
-                    container_no=excluded.container_no;
-            """, (batch_id, inbound_date, marketplace, container_no))
-            conn.commit()
-        st.success("Lot header saved.")
+        st.markdown("**Duty Pools (by Category)**")
+        df_d = st.data_editor(pd.DataFrame([{
+            "batch_id":"", "category":"", "duty_total":0
+        }]), num_rows="dynamic", use_container_width=True)
+        if st.button("Save Duty Pools"):
+            upsert_batch_duty_pool(df_d.fillna(0).to_dict("records"))
+            st.success("Duty pool saved")
 
-    st.markdown("---")
-    st.markdown("**Inbound Items (paste table)**")
-    st.caption("Columns: internal_sku | qty_in | fob_unit | cbm_per_unit | weight_kg")
-    data_items = st.data_editor(pd.DataFrame(columns=["internal_sku","qty_in","fob_unit","cbm_per_unit","weight_kg"]),
-                                num_rows="dynamic", use_container_width=True, key="items_editor")
+# -------- Sales --------
+with tabs[1]:
+    st.subheader("Upload Amazon Monthly CSV")
+    c1, c2 = st.columns([2,1])
+    with c1:
+        file = st.file_uploader("Amazon Monthly Unified Transaction CSV", type=["csv"])
+    with c2:
+        marketplace = st.text_input("Marketplace", value="US")
+        ym = st.text_input("Month (YYYY-MM)", value=datetime.today().strftime("%Y-%m"))
+        run_btn = st.button("Run Month (Rebuild → FIFO → Summarize)")
 
-    if st.button("Commit Items to Lot"):
-        df = data_items.dropna(subset=["internal_sku"])
-        rows = [ (batch_id, marketplace, r.internal_sku, float(r.qty_in), float(r.fob_unit), float(r.cbm_per_unit or 0), float(r.weight_kg or 0))
-                  for r in df.itertuples(index=False) ]
-        with get_conn() as conn, conn.cursor() as cur:
-            for r in rows:
-                cur.execute("""
-                  insert into inbound_items(batch_id, marketplace, internal_sku, qty_in, fob_unit, cbm_per_unit, weight_kg)
-                  values (%s,%s,%s,%s,%s,%s,%s)
-                  on conflict (batch_id, marketplace, internal_sku) do update
-                    set qty_in=excluded.qty_in, fob_unit=excluded.fob_unit, cbm_per_unit=excluded.cbm_per_unit, weight_kg=excluded.weight_kg;
-                """, r)
-            conn.commit()
-        st.success("Inbound items saved.")
+    if file and st.button("Import Orders"):
+        load_sales_raw_from_csv(file.getvalue(), marketplace)
+        st.success("Orders imported to sales_raw")
 
-    st.markdown("---")
-    st.markdown("**Duty/Freight/Entry by Category**")
-    st.caption("按‘品类’输入一条柜的三类费用（可多行）")
-    tax_df = st.data_editor(pd.DataFrame(columns=["category","freight_total","entry_total","duty_total"]),
-                            num_rows="dynamic", use_container_width=True, key="tax_editor")
+    if run_btn:
+        rpc("run_month", {"p_ym": ym, "p_market": marketplace if marketplace else None})
+        st.success(f"Done: {ym} {marketplace or 'ALL'}")
 
-    if st.button("Commit Category Pools"):
-        df = tax_df.dropna(subset=["category"])
-        rows = [ (batch_id, marketplace, r.category, float(r.freight_total or 0), float(r.entry_total or 0), float(r.duty_total or 0))
-                for r in df.itertuples(index=False)]
-        with get_conn() as conn, conn.cursor() as cur:
-            for r in rows:
-                cur.execute("""
-                  insert into inbound_tax_pool(batch_id, marketplace, category, freight_total, entry_total, duty_total)
-                  values (%s,%s,%s,%s,%s,%s)
-                  on conflict (batch_id, marketplace, category) do update
-                    set freight_total=excluded.freight_total,
-                        entry_total=excluded.entry_total,
-                        duty_total=excluded.duty_total;
-                """, r)
-            conn.commit()
-        st.success("Pools saved. Next: Build lot costs & balance.")
+# -------- Inventory --------
+with tabs[2]:
+    st.subheader("Current Inventory & Alerts")
+    st.write("在 Supabase Table Editor 可直接查看 `lot_balance`。建议后续做专门的 REST 视图或 RPC 导出。")
 
-    if st.button("Build lot_cost & lot_balance (this lot)"):
-        with get_conn() as conn, conn.cursor() as cur:
-            cur.execute("select build_lot_costs(%s,%s);", (batch_id, marketplace))
-            cur.execute("select rebuild_lot_balance(%s,%s);", (batch_id, marketplace))
-            conn.commit()
-        st.success("lot_cost and lot_balance ready ✅")
+# -------- Summary --------
+with tabs[3]:
+    st.subheader("Monthly Summary")
+    st.write("查看 `month_summary` 与 `month_history`（可在 Supabase 直接预览/导出）。")
 
-with tab_sales:
-    st.subheader("2) Upload Monthly Sales CSV")
-    st.caption("粘贴亚马逊 Monthly Unified Transaction CSV（整月），系统只取 'Order' 和 'Refund'。")
+# -------- Mapping --------
+with tabs[4]:
+    st.subheader("Category / Products / SKU Map / Kits")
+    c1,c2 = st.columns(2)
+    with c1:
+        st.markdown("**Category**")
+        df_c = st.data_editor(pd.DataFrame([{"category":"","duty_rate_default":None}]), num_rows="dynamic", use_container_width=True)
+        if st.button("Save Categories"):
+            upsert_category(df_c.fillna("").to_dict("records"))
+            st.success("Categories saved")
 
-    marketplace = st.selectbox("Marketplace", ["US","EU","JP"], index=0, key="market_sale")
-    file = st.file_uploader("Upload CSV", type=["csv"])
-    if file:
-        stats = load_sales_raw_from_csv(file.read(), marketplace)
-        st.success(f"Loaded rows by month: {stats}")
+        st.markdown("**Products**")
+        df_p = st.data_editor(pd.DataFrame([{
+            "internal_sku":"", "category":"", "weight_kg_per_unit":0, "cbm_per_unit":0, "active":True
+        }]), num_rows="dynamic", use_container_width=True)
+        if st.button("Save Products"):
+            upsert_products(df_p.fillna("").to_dict("records"))
+            st.success("Products saved")
 
-    st.markdown("---")
-    st.markdown("**Kit Map**（组合柜映射）")
-    st.caption("列: marketplace | amazon_sku | internal_sku | unit_multiplier | combo_group(可选)")
-    kit_df = st.data_editor(pd.DataFrame(columns=["marketplace","amazon_sku","internal_sku","unit_multiplier","combo_group"]),
-                            num_rows="dynamic", use_container_width=True, key="kit_editor")
-    if st.button("Upsert SKU Map"):
-        df = kit_df.dropna(subset=["marketplace","amazon_sku","internal_sku","unit_multiplier"])
-        with get_conn() as conn, conn.cursor() as cur:
-            for r in df.itertuples(index=False):
-                cg = getattr(r, "combo_group", None) or 'default'
-                cur.execute("""
-                    insert into sku_map(marketplace, amazon_sku, internal_sku, unit_multiplier, combo_group)
-                    values(%s,%s,%s,%s,%s)
-                    on conflict (marketplace, amazon_sku, internal_sku, combo_group) do update
-                      set unit_multiplier=excluded.unit_multiplier;
-                """, (r.marketplace, r.amazon_sku, r.internal_sku, float(r.unit_multiplier), cg))
-            conn.commit()
-        st.success("SKU Map saved.")
+    with c2:
+        st.markdown("**SKU Map (Amazon → Internal)**")
+        df_m = st.data_editor(pd.DataFrame([{
+            "amazon_sku":"", "marketplace":"US", "internal_sku":"", "unit_multiplier":1, "active":True
+        }]), num_rows="dynamic", use_container_width=True)
+        if st.button("Save SKU Map"):
+            upsert_sku_map(df_m.fillna("").to_dict("records"))
+            st.success("SKU Map saved")
 
-with tab_close:
-    st.subheader("3) Month Close (Explode kits → FIFO → Summaries)")
-    ym = st.text_input("Month (YYYY-MM) *", placeholder="2025-03")
-    marketplace = st.selectbox("Marketplace", ["US","EU","JP"], index=0, key="market_close")
-    combo = st.text_input("Combo group (optional)", value="default")
-
-    if st.button("Run Month Close"):
-        run_all(ym=ym, marketplace=marketplace, combo_group=combo)
-        st.success("Month closed. Summaries updated & snapshot stored.")
-
-with tab_inv:
-    st.subheader("Inventory (by internal SKU)")
-    marketplace = st.selectbox("Marketplace", ["US","EU","JP"], index=0, key="market_inv")
-    with get_conn() as conn, conn.cursor() as cur:
-        cur.execute("select * from v_inventory where marketplace=%s order by internal_sku;", (marketplace,))
-        rows = cur.fetchall()
-    df = pd.DataFrame(rows, columns=["marketplace","internal_sku","qty"])
-    st.dataframe(df, use_container_width=True)
-
-with tab_logs:
-    st.subheader("Recent Month Summaries")
-    rows = last_runs()
-    if rows:
-        st.dataframe(pd.DataFrame(rows, columns=["ym","marketplace","orders","units","fob_total","freight_total","entry_total","duty_total","updated_at"]),
-                     use_container_width=True)
-    else:
-        st.info("No summaries yet.")
+        st.markdown("**Kit BOM (for bundles)**")
+        df_k = st.data_editor(pd.DataFrame([{
+            "amazon_sku":"", "marketplace":"US", "component_sku":"", "component_qty":1
+        }]), num_rows="dynamic", use_container_width=True)
+        if st.button("Save Kit BOM"):
+            upsert_kit_bom(df_k.fillna("").to_dict("records"))
+            st.success("Kit BOM saved")
