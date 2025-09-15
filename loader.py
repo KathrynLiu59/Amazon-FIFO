@@ -1,101 +1,59 @@
 # loader.py
-from typing import Sequence
+import io
 import pandas as pd
 from psycopg import sql
-from db import get_conn
+from psycopg.extras import execute_values
+from db import connect
 
-try:
-    from psycopg.extras import execute_values  # psycopg v3 可用
-except Exception:
-    execute_values = None
+# —— 核心：把 Amazon Monthly Unified Transaction（CSV）导入 sales_raw
+# 只取到我们需要的核心列；其余保存在 raw_json（可选）
+RAW_COL_MAP = {
+    "date/time": "happened_at",
+    "type": "type",
+    "order id": "order_id",
+    "sku": "sku",
+    "quantity": "quantity",
+    "marketplace": "marketplace",
+}
 
-def _cast_str(v):
-    if pd.isna(v):
-        return None
-    return str(v)
+def _normalize_headers(cols):
+    # 统一成小写去空格便于映射
+    return [str(c).strip().lower() for c in cols]
 
-def upsert_df(table: str, df: pd.DataFrame, conflict_cols: Sequence[str] | None):
-    if df is None or df.empty:
-        return
-    df = df.copy()
-    # 把 pandas 的 NaN 统一转 None，避免插入报错
-    df = df.where(pd.notnull(df), None)
+def load_sales_raw_from_csv(file_bytes: bytes) -> int:
+    df = pd.read_csv(io.BytesIO(file_bytes))
+    df.columns = _normalize_headers(df.columns)
 
-    cols = list(df.columns)
-    values = [tuple(x) for x in df.to_numpy()]
+    keep = {src: RAW_COL_MAP[src] for src in RAW_COL_MAP if src in df.columns}
+    df = df[list(keep.keys())].rename(columns=keep)
 
-    with get_conn() as conn, conn.cursor() as cur:
-        insert_stmt = sql.SQL("insert into {t} ({cols}) values %s").format(
-            t=sql.Identifier(table),
-            cols=sql.SQL(',').join(map(sql.Identifier, cols))
-        )
-        if conflict_cols:
-            updates = sql.SQL(',').join(
-                sql.SQL("{}=excluded.{}").format(sql.Identifier(c), sql.Identifier(c))
-                for c in cols if c not in conflict_cols
-            )
-            insert_stmt = insert_stmt + sql.SQL(" on conflict ({keys}) do update set {upd}").format(
-                keys=sql.SQL(',').join(map(sql.Identifier, conflict_cols)),
-                upd=updates
-            )
+    # 小清洗
+    if "quantity" in df:
+        df["quantity"] = pd.to_numeric(df["quantity"], errors="coerce").fillna(0)
 
-        if execute_values:
-            execute_values(cur, insert_stmt.as_string(conn), values, page_size=2000)
-        else:
-            # 回退策略：逐条 executemany
-            single = sql.SQL("insert into {t} ({cols}) values ({ph})").format(
-                t=sql.Identifier(table),
-                cols=sql.SQL(',').join(map(sql.Identifier, cols)),
-                ph=sql.SQL(',').join(sql.Placeholder() for _ in cols)
-            )
-            if conflict_cols:
-                single = single + sql.SQL(" on conflict ({keys}) do update set {upd}").format(
-                    keys=sql.SQL(',').join(map(sql.Identifier, conflict_cols)),
-                    upd=updates
+    # 批量插入
+    rows = df.to_dict("records")
+    if not rows:
+        return 0
+
+    with connect() as conn, conn.cursor() as cur:
+        execute_values(
+            cur,
+            """
+            insert into sales_raw(happened_at, type, order_id, sku, quantity, marketplace, raw_json)
+            values %s
+            """,
+            [
+                (
+                    r.get("happened_at"),
+                    r.get("type"),
+                    r.get("order_id"),
+                    r.get("sku"),
+                    r.get("quantity"),
+                    (r.get("marketplace") or "US").upper(),
+                    None,
                 )
-            cur.executemany(single, values)
-
-def csv_to_df(file, encoding='utf-8'):
-    import pandas as pd
-    return pd.read_csv(file, dtype=str, encoding=encoding, keep_default_na=False, na_values=[''])
-
-def parse_amz_unified_csv(df: pd.DataFrame, ym: str, marketplace: str) -> pd.DataFrame:
-    # 仅抽取“订单”行；保留原文，按我们统一字段命名落到 sales_raw
-    # 兼容不同导出列名的大小写/空格
-    rename = {c: c.strip().lower().replace(' ', '_') for c in df.columns}
-    df = df.rename(columns=rename)
-    # 标准列：date/time, type, order id, sku, quantity
-    need = ['date/time', 'type', 'order id', 'sku', 'quantity']
-    # 有些导出列会是 date_time / order_id，做一次映射容错
-    alt = {
-        'date/time': ['date_time', 'date'],
-        'order id': ['order_id','amazon_order_id'],
-        'sku': ['seller_sku','product_id'],
-        'quantity': ['quantity_purchased','qty']
-    }
-    for k in list(rename.values()):
-        pass
-    for k in need:
-        if k not in df.columns:
-            cands = alt.get(k, [])
-            found = None
-            for a in cands:
-                if a in df.columns:
-                    found = a
-                    break
-            if found:
-                df[k] = df[found]
-            else:
-                df[k] = None
-
-    out = pd.DataFrame({
-        'ym': ym,
-        'marketplace': marketplace,
-        'date_time': df['date/time'],
-        'type': df['type'],
-        'order_id': df['order id'],
-        'sku': df['sku'],
-        'quantity': df['quantity'],
-        'payload': df.to_json(orient='records')
-    })
-    return out
+                for r in rows
+            ],
+        )
+    return len(rows)
