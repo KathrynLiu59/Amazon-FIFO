@@ -1,34 +1,34 @@
 # db.py
 import os
 import psycopg
-from psycopg.rows import dict_row
+from contextlib import contextmanager
 
-def _dsn() -> str:
-    # 你在 Streamlit Secrets 里填的那个连接串变量名
-    # 支持两种命名，取其一：
-    return (
-        os.environ.get("DB_DSN")
-        or os.environ.get("SUPABASE_DSN")
-        or os.environ.get("SUPABASE_URL")  # 兜底（如果你误放了 URL，此处也能报错提醒）
-    )
+DB_DSN = os.getenv("DB_DSN")
+if not DB_DSN:
+    raise RuntimeError("Missing DB_DSN in Streamlit Secrets. Put it in the app's Secrets.")
 
-def get_conn() -> psycopg.Connection:
-    dsn = _dsn()
-    if not dsn or not dsn.startswith("postgres://") and not dsn.startswith("postgresql://"):
-        raise RuntimeError(
-            "Database DSN is not configured. Set DB_DSN (or SUPABASE_DSN) in Streamlit → App → Settings → Secrets."
-        )
-    # 建议统一由 with conn: 控制事务（自动提交/回滚）
-    return psycopg.connect(dsn)
+def get_conn():
+    return psycopg.connect(DB_DSN)
 
-def fetchall(sql: str, params: tuple | None = None):
-    with get_conn() as conn:
-        with conn.cursor(row_factory=dict_row) as cur:
-            cur.execute(sql, params or ())
-            return cur.fetchall()
-
-def execute(sql: str, params: tuple | None = None) -> None:
+@contextmanager
+def cursor():
     with get_conn() as conn:
         with conn.cursor() as cur:
-            cur.execute(sql, params or ())
-        # with conn: 会自动 commit
+            yield cur
+        conn.commit()
+
+def run_sql(sql_text: str, params: tuple | None = None):
+    with cursor() as cur:
+        cur.execute(sql_text, params or ())
+
+def fetchall(sql_text: str, params: tuple | None = None):
+    with cursor() as cur:
+        cur.execute(sql_text, params or ())
+        cols = [d[0] for d in cur.description]
+        rows = cur.fetchall()
+    return cols, rows
+
+def fetchdf(sql_text: str, params: tuple | None = None):
+    import pandas as pd
+    cols, rows = fetchall(sql_text, params)
+    return pd.DataFrame(rows, columns=cols)
