@@ -8,7 +8,10 @@ from worker import expand_movements, fifo_allocate, summarize, reverse_order
 st.set_page_config(page_title="Amazon FIFO Portal", layout="wide")
 st.title("Amazon FIFO Portal")
 
-tabs = st.tabs(["Inbound Upload", "Sales Upload", "Inventory", "Adjustments", "Reports", "Master Data"])
+tabs = st.tabs([
+    "Inbound Upload", "Tax Upload", "Sales Upload", "Inventory",
+    "Adjustments", "Reports", "Master Data", "Kit BOM", "Admin"
+])
 
 # =============== Inbound Upload ===============
 with tabs[0]:
@@ -50,7 +53,6 @@ with tabs[0]:
             st.error(f"CSV parse error: {e}")
 
     if not df.empty:
-        # normalize columns (case-insensitive)
         lowmap = {c.lower(): c for c in df.columns}
         def pick(*names):
             for n in names:
@@ -92,18 +94,63 @@ with tabs[0]:
                         "FOB per Unit":"fob_unit",
                         "CBM per Unit":"cbm_per_unit",
                     })[["batch_id","inbound_date","internal_sku","category","qty_in","fob_unit","cbm_per_unit","freight_total","entryfees_total"]]
-                    # 先写到 inbound_items_flat，再调用存储过程将其灌入正式表并重算成本
                     df_insert(out, "inbound_items_flat", truncate_first=True)
                     execute("select ingest_inbound_items();")
                     st.success(f"Saved {len(out)} items and rebuilt costs.")
 
-# =============== Sales Upload ===============
+# =============== Tax Upload ===============
 with tabs[1]:
+    st.subheader("Tax / Duty by Batch")
+    st.caption("Fill category-level duty pool and optional per-SKU overrides, then Commit.")
+    batch_for_tax = st.text_input("Batch ID for tax", placeholder="e.g., WF2305")
+
+    st.markdown("**Category Duty Pool**  (columns: Category, Duty Total)")
+    pool_paste = st.text_area("Paste CSV/TSV for Pool (or leave blank to use table below)", height=120, key="tax_pool_paste")
+    if pool_paste.strip():
+        pool_df = parse_paste(pool_paste)
+    else:
+        pool_df = st.data_editor(
+            pd.DataFrame(columns=["Category","Duty Total"]),
+            num_rows="dynamic", use_container_width=True, key="tax_pool_editor"
+        )
+
+    st.markdown("**Item Duty Overrides (optional)**  (columns: SKU, Duty Amount)")
+    ov_paste = st.text_area("Paste CSV/TSV for Overrides (or leave blank to use table below)", height=120, key="tax_ov_paste")
+    if ov_paste.strip():
+        override_df = parse_paste(ov_paste)
+    else:
+        override_df = st.data_editor(
+            pd.DataFrame(columns=["SKU","Duty Amount"]),
+            num_rows="dynamic", use_container_width=True, key="tax_override_editor"
+        )
+
+    if st.button("Commit Tax"):
+        if not batch_for_tax:
+            st.error("Please input Batch ID.")
+        else:
+            # write to inbound_tax_pool / inbound_tax_item and run ingest_inbound_tax()
+            if not pool_df.empty:
+                p = pool_df.rename(columns={"Category":"category","Duty Total":"duty_total"})
+                p["batch_id"] = batch_for_tax
+                df_insert(p[["batch_id","category","duty_total"]], "inbound_tax_pool", truncate_first=True)
+            else:
+                execute("truncate table inbound_tax_pool;")
+            if not override_df.empty:
+                o = override_df.rename(columns={"SKU":"internal_sku","Duty Amount":"duty_amount"})
+                o["batch_id"] = batch_for_tax
+                df_insert(o[["batch_id","internal_sku","duty_amount"]], "inbound_tax_item", truncate_first=True)
+            else:
+                execute("truncate table inbound_tax_item;")
+            execute("select ingest_inbound_tax();")
+            st.success("Tax committed & costs rebuilt.")
+
+# =============== Sales Upload ===============
+with tabs[2]:
     st.subheader("Amazon Sales")
     tz = st.text_input("Timezone", "UTC")
     colsu = st.columns(2)
     f = colsu[0].file_uploader("Upload CSV", type=["csv"], key="sales_csv")
-    pasted = colsu[1].text_area("Or paste CSV/TSV (must include columns: date/time, type, order id, sku, quantity)", height=180, key="sales_paste")
+    pasted = colsu[1].text_area("Or paste CSV/TSV (must include: date/time, type, order id, sku, quantity)", height=180, key="sales_paste")
 
     if st.button("Import Sales"):
         try:
@@ -125,7 +172,7 @@ with tabs[1]:
             st.error(str(e))
 
 # =============== Inventory ===============
-with tabs[2]:
+with tabs[3]:
     st.subheader("Inventory")
     rows = execute("""
         select p.internal_sku as sku, p.category, coalesce(sum(lb.qty_remaining),0) as qty_left
@@ -138,27 +185,27 @@ with tabs[2]:
     st.dataframe(inv, use_container_width=True)
 
 # =============== Adjustments ===============
-with tabs[3]:
+with tabs[4]:
     st.subheader("Reverse / Adjust by Order ID")
     oid = st.text_input("Order ID")
     note = st.text_input("Note (optional)")
     if st.button("Reverse Allocation"):
         try:
             reverse_order(oid, note)
-            st.success(f"Reversed {oid}. Go to Reports to recompute.")
+            st.success(f"Reversed {oid}. Then go to Reports to recompute.")
         except Exception as e:
             st.error(str(e))
 
 # =============== Reports ===============
-with tabs[4]:
+with tabs[5]:
     st.subheader("Run / View Reports")
-    d = st.date_input("Recompute From", value=date(date.today().year, date.today().month, 1))
+    d = st.date_input("Recompute From (choose the 1st of the month you are closing)", value=date(date.today().year, date.today().month, 1))
     iso = datetime.combine(d, datetime.min.time()).isoformat()
 
-    c1, c2, c3 = st.columns(3)
+    c1, c2, c3, c4 = st.columns(4)
     if c1.button("Expand Movements"):
         try:
-            expand_movements(iso); st.success("Done.")
+            expand_movements(iso); st.success("Movements expanded.")
         except Exception as e:
             st.error(str(e))
     if c2.button("FIFO Allocate"):
@@ -171,6 +218,21 @@ with tabs[4]:
             summarize(); st.success("Summary updated.")
         except Exception as e:
             st.error(str(e))
+    if c4.button("Save Monthly Snapshot"):
+        try:
+            # simple snapshot table for month_summary
+            execute("""
+            create table if not exists month_summary_snapshot (
+                snapshot_time timestamptz default now(),
+                month date,
+                fob numeric, freight numeric, duty numeric, clearance numeric, headhaul numeric, orders integer
+            );
+            insert into month_summary_snapshot(month, fob, freight, duty, clearance, headhaul, orders)
+            select month, fob, freight, duty, clearance, headhaul, orders from month_summary;
+            """)
+            st.success("Snapshot saved.")
+        except Exception as e:
+            st.error(str(e))
 
     rows = execute("""
         select month, fob, freight, duty, clearance, headhaul, orders
@@ -181,7 +243,7 @@ with tabs[4]:
     st.dataframe(sm, use_container_width=True)
 
 # =============== Master Data ===============
-with tabs[5]:
+with tabs[6]:
     st.subheader("Products")
     pdf = fetch_df(
         "select internal_sku as sku, category, cbm_per_unit as cbm_per_unit, fob_default as fob_default, reorder_point from product order by sku;",
@@ -192,7 +254,7 @@ with tabs[5]:
         if not edit.empty:
             out = edit.rename(columns={"SKU":"internal_sku","CBM per Unit":"cbm_per_unit","FOB Default":"fob_default"})
             df_upsert(out, "product", conflict_cols=["internal_sku"])
-            st.success("Saved.")
+            st.success("Products saved.")
 
     st.divider()
     st.subheader("SKU Mapping (Amazon → Internal)")
@@ -207,3 +269,117 @@ with tabs[5]:
             df_upsert(out.fillna({"marketplace":"US","unit_multiplier":1}), "sku_map",
                       conflict_cols=["sku","marketplace","internal_sku"])
             st.success("Mapping saved.")
+
+# =============== Kit BOM ===============
+with tabs[7]:
+    st.subheader("Kit BOM (Amazon SKU → Components)")
+    kb = fetch_df(
+        "select sku, coalesce(marketplace,'US') as marketplace, component_sku, units_per_kit from kit_bom order by sku, component_sku;",
+        columns=["Amazon SKU","Marketplace","Component SKU","Units per Kit"]
+    )
+    kb_edit = st.data_editor(kb, num_rows="dynamic", use_container_width=True, key="kitbom_edit")
+    if st.button("Save Kit BOM"):
+        if not kb_edit.empty:
+            out = kb_edit.rename(columns={"Amazon SKU":"sku","Component SKU":"component_sku","Units per Kit":"units_per_kit"})
+            df_upsert(out.fillna({"marketplace":"US"}), "kit_bom",
+                      conflict_cols=["sku","marketplace","component_sku"])
+            st.success("Kit BOM saved.")
+
+# =============== Admin ===============
+with tabs[8]:
+    st.subheader("Admin — Snapshots & Reset")
+
+    st.markdown("### Export Snapshots (CSV)")
+    colx1, colx2, colx3, colx4 = st.columns(4)
+    if colx1.button("Export Inventory Lots"):
+        rows = execute("""
+            select b.batch_id, b.inbound_date, il.internal_sku, il.qty_in,
+                   coalesce(lc.fob_unit,0), coalesce(lc.freight_per_unit,0),
+                   coalesce(lc.duty_per_unit,0), coalesce(lc.clearance_per_unit,0)
+            from batch b
+            join inbound_lot il on il.batch_id=b.batch_id
+            left join lot_cost lc on lc.batch_id=il.batch_id and lc.internal_sku=il.internal_sku
+            order by b.inbound_date, b.batch_id, il.internal_sku;
+        """)
+        df = pd.DataFrame(rows, columns=["batch_id","inbound_date","internal_sku","qty_in","fob_unit","freight_unit","duty_unit","clearance_unit"])
+        st.download_button("Download lots.csv", df.to_csv(index=False).encode("utf-8"), "lots.csv", "text/csv")
+    if colx2.button("Export Sales"):
+        rows = execute("select happened_at, type, order_id, sku, marketplace, qty from sales_txn order by happened_at;")
+        df = pd.DataFrame(rows, columns=["happened_at","type","order_id","sku","marketplace","qty"])
+        st.download_button("Download sales.csv", df.to_csv(index=False).encode("utf-8"), "sales.csv", "text/csv")
+    if colx3.button("Export Allocations"):
+        rows = execute("""
+            select happened_at, internal_sku, qty, batch_id, order_id, fob_unit, freight_unit, duty_unit, clearance_unit
+            from allocation_detail order by happened_at;
+        """)
+        df = pd.DataFrame(rows, columns=["happened_at","internal_sku","qty","batch_id","order_id","fob_unit","freight_unit","duty_unit","clearance_unit"])
+        st.download_button("Download allocations.csv", df.to_csv(index=False).encode("utf-8"), "allocations.csv", "text/csv")
+    if colx4.button("Export Summary"):
+        rows = execute("select month, fob, freight, duty, clearance, headhaul, orders from month_summary order by month;")
+        df = pd.DataFrame(rows, columns=["month","fob","freight","duty","clearance","headhaul","orders"])
+        st.download_button("Download summary.csv", df.to_csv(index=False).encode("utf-8"), "summary.csv", "text/csv")
+
+    st.markdown("### Save / Restore Monthly Summary Snapshot")
+    c1, c2 = st.columns(2)
+    if c1.button("Save Snapshot Now"):
+        execute("""
+        create table if not exists month_summary_snapshot (
+            snapshot_time timestamptz default now(),
+            month date,
+            fob numeric, freight numeric, duty numeric, clearance numeric, headhaul numeric, orders integer
+        );
+        insert into month_summary_snapshot(month, fob, freight, duty, clearance, headhaul, orders)
+        select month, fob, freight, duty, clearance, headhaul, orders from month_summary;
+        """)
+        st.success("Snapshot saved.")
+    snap_month = c2.text_input("Restore month (YYYY-MM)", "")
+    if st.button("Restore Month Summary"):
+        if not snap_month.strip():
+            st.error("Enter YYYY-MM.")
+        else:
+            try:
+                execute("""
+                delete from month_summary where to_char(month,'YYYY-MM') = %s;
+                insert into month_summary(month, fob, freight, duty, clearance, headhaul, orders)
+                select month, fob, freight, duty, clearance, headhaul, orders
+                from month_summary_snapshot
+                where to_char(month,'YYYY-MM') = %s;
+                """, (snap_month, snap_month))
+                st.success(f"Restored month {snap_month} from snapshot.")
+            except Exception as e:
+                st.error(str(e))
+
+    st.markdown("### Reset Data")
+    choice = st.radio("Reset Level", ["Transactional only (recommended for testing)", "Full wipe (keep master data only)"])
+    confirm = st.text_input("Type: RESET to confirm")
+
+    if st.button("Run Reset"):
+        if confirm.strip().upper() != "RESET":
+            st.error("Please type RESET to confirm.")
+        else:
+            try:
+                if choice.startswith("Transactional"):
+                    execute("delete from allocation_detail;")
+                    execute("delete from movement;")
+                    execute("delete from sales_txn;")
+                    execute("delete from lot_balance;")
+                    execute("delete from lot_cost;")
+                    execute("delete from month_summary;")
+                    execute("delete from inbound_tax_item;")
+                    execute("delete from inbound_tax_pool;")
+                    st.success("Transactional tables cleared.")
+                else:
+                    execute("delete from allocation_detail;")
+                    execute("delete from movement;")
+                    execute("delete from sales_txn;")
+                    execute("delete from lot_balance;")
+                    execute("delete from lot_cost;")
+                    execute("delete from month_summary;")
+                    execute("delete from inbound_tax_item;")
+                    execute("delete from inbound_tax_pool;")
+                    execute("delete from inbound_lot;")
+                    execute("delete from batch;")
+                    execute("do $$ begin if to_regclass('public.inbound_items_flat') is not null then delete from inbound_items_flat; end if; end $$;")
+                    st.success("Full wipe done (master data kept).")
+            except Exception as e:
+                st.error(str(e))
