@@ -1,78 +1,69 @@
-# loader.py
+# loader.py —— 统一导入：Amazon 月报 / 入库 / 成本池 / 税金池 / 映射 / 组合柜
 import io
 import pandas as pd
-from db import get_conn
+from datetime import datetime
+from dateutil import parser
+from db import upsert
 
+# 4.1 Amazon 月报 CSV -> sales_raw
+def load_sales_raw_from_csv(file_bytes: bytes, marketplace: str):
+    df = pd.read_csv(io.BytesIO(file_bytes))
+    # 兼容字段名（以你截图为准，可自行补充更多别名）
+    col = {c.lower(): c for c in df.columns}
+    must = ["date/time","type","order id","sku","quantity","marketplace"]  # 如站点列名不同，这里统一成 marketplace 传参覆盖
+    for m in must:
+        if m not in col:
+            raise ValueError(f"Missing column: {m}")
 
-def _noneify(df: pd.DataFrame) -> list[list]:
-    """把 DataFrame 转 list[list]，并将 NaN 转为 None。"""
-    return df.where(pd.notna(df), None).values.tolist()
+    def parse_dt(s):
+        try: return parser.parse(str(s))
+        except: return None
 
+    rows = []
+    for _, r in df.iterrows():
+        happened_at = parse_dt(r[col["date/time"]])
+        if happened_at is None: 
+            continue
+        rows.append({
+            "happened_at": happened_at.isoformat(),
+            "type": str(r[col["type"]]),
+            "order_id": str(r[col["order id"]]),
+            "amazon_sku": str(r[col["sku"]]),
+            "quantity": int(pd.to_numeric(r[col["quantity"]], errors="coerce") or 0),
+            "marketplace": marketplace or str(r.get(col.get("marketplace",""), marketplace) or marketplace),
+            "payload": {k:str(r[k]) for k in df.columns}
+        })
 
-def bulk_insert_dataframe(table: str, df: pd.DataFrame):
-    """
-    通用批量写入：INSERT INTO table (col1, col2, ...) VALUES (%s, %s, ...)
-    兼容 psycopg / pg8000 两种驱动的 paramstyle（都支持 %s）
-    """
-    if df.empty:
-        return 0
+    # 仅保留 type=Order & quantity>0 的行，其它行也可以先入库保留
+    rows = [x for x in rows if x["type"] in ("Order","order") and x["quantity"]>0]
+    if rows:
+        upsert("sales_raw", rows, on_conflict=["order_id","amazon_sku","happened_at"])
 
-    cols = list(df.columns)
-    placeholders = "(" + ",".join(["%s"] * len(cols)) + ")"
-    sql = f"insert into {table} ({','.join(cols)}) values {placeholders}"
+# 4.2 基础维表导入
+def upsert_products(rows: list[dict]):         # {internal_sku, category, weight_kg_per_unit, cbm_per_unit}
+    return upsert("product", rows, on_conflict=["internal_sku"])
 
-    rows = _noneify(df)
+def upsert_category(rows: list[dict]):         # {category, duty_rate_default}
+    return upsert("category", rows, on_conflict=["category"])
 
-    with get_conn() as conn:
-        cur = conn.cursor()
-        cur.executemany(sql, rows)
-        cur.close()
-    return len(rows)
+def upsert_sku_map(rows: list[dict]):          # {amazon_sku, marketplace, internal_sku, unit_multiplier, active}
+    return upsert("sku_map", rows, on_conflict=["amazon_sku","marketplace"])
 
+def upsert_kit_bom(rows: list[dict]):          # {amazon_sku, marketplace, component_sku, component_qty}
+    return upsert("kit_bom", rows, on_conflict=["amazon_sku","marketplace","component_sku"])
 
-def load_sales_raw_from_csv(csv_bytes: bytes, marketplace: str | None = None):
-    """
-    读取你每月 Amazon 导出的 CSV（原样列名），按你们既有落表规则写入 sales_raw。
-    这里不做复杂清洗，只负责“导入”；之后的匹配、分摊、月结由 worker 调度 SQL 来做。
-    """
-    buf = io.BytesIO(csv_bytes)
-    # 让 pandas 直接用第一行做列名；保留原始列（和你传的模板对齐）
-    df = pd.read_csv(buf, dtype=str).fillna("")
+# 4.3 入库 & 成本池
+def upsert_batch(rows: list[dict]):            # {batch_id, container_no, arrived_at, dest_market, note}
+    for r in rows:
+        if isinstance(r.get("arrived_at"), (pd.Timestamp, datetime)):
+            r["arrived_at"] = r["arrived_at"].date().isoformat()
+    return upsert("batch", rows, on_conflict=["batch_id"])
 
-    # 可以在这里做最轻量的标准化（示例：去除列名里的空格）
-    df.columns = [c.strip().lower().replace(" ", "_") for c in df.columns]
+def upsert_inbound_items(rows: list[dict]):    # {batch_id, internal_sku, category, qty_in, fob_unit, cbm_per_unit, weight_kg_per_unit, duty_override_unit}
+    return upsert("inbound_items", rows, on_conflict=["batch_id","internal_sku"])
 
-    if marketplace and "marketplace" in df.columns:
-        # 如果你想强制写 marketplace 字段（可选）
-        df["marketplace"] = marketplace
+def upsert_batch_cost_pool(rows: list[dict]):  # {batch_id, freight_total, clearance_total}
+    return upsert("batch_cost_pool", rows, on_conflict=["batch_id"])
 
-    # 按你们的 sales_raw 结构，挑选/重命名列（示例）——
-    # 如果表结构和列名与你们最终 schema 有差异，请在这里调整映射：
-    # （下面是参考映射，你可以按你最终 sales_raw 列名替换）
-    rename_map = {
-        "date/time": "date_time",
-        "order id": "order_id",
-        "sku": "sku",
-        "quantity": "quantity",
-        "product sales": "product_sales",
-        "product sales tax": "product_sales_tax",
-        "shipping credits": "shipping_credits",
-        "gift wrap credits": "gift_wrap_credits",
-        "promotional rebates": "promotional_rebates",
-        "selling fees": "selling_fees",
-        "fba fees": "fba_fees",
-        "other transaction fees": "other_fees",
-        "other": "other",
-        "description": "description",
-        "fulfillment": "fulfillment",
-        "city": "order_city",
-        "state": "order_state",
-        "postal": "order_postal",
-        # … 你可以继续补充
-    }
-    # 把 rename_map 里存在的列才重命名
-    df = df.rename(columns={k: v for k, v in rename_map.items() if k in df.columns})
-
-    # 写入 sales_raw（确保 sales_raw 已建好；列要与 df.columns 对齐）
-    inserted = bulk_insert_dataframe("sales_raw", df)
-    return inserted
+def upsert_batch_duty_pool(rows: list[dict]):  # {batch_id, category, duty_total}
+    return upsert("batch_duty_pool", rows, on_conflict=["batch_id","category"])
