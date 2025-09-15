@@ -3,8 +3,7 @@ import pandas as pd
 from db import execute
 
 def _read_amz_unified_bytes(file_bytes: bytes) -> pd.DataFrame:
-    """Robust reader for Amazon Monthly Unified Transaction CSV with preface lines."""
-    # decode with fallback
+    """Robust reader: skip preface lines until header with 'date/time' appears; keep quotes; lower-case columns."""
     try:
         text = file_bytes.decode("utf-8")
     except UnicodeDecodeError:
@@ -12,12 +11,11 @@ def _read_amz_unified_bytes(file_bytes: bytes) -> pd.DataFrame:
         enc = chardet.detect(file_bytes).get("encoding", "utf-8")
         text = file_bytes.decode(enc, errors="ignore")
 
-    # find header line
     lines = text.splitlines()
     hdr_idx = None
-    for i, line in enumerate(lines[:300]):
-        low = line.lower()
-        if ("date/time" in low) and ("type" in low) and ("order id" in low):
+    for i, line in enumerate(lines[:200]):
+        ll = line.lower()
+        if "date/time" in ll and "type" in ll and "order id" in ll:
             hdr_idx = i
             break
     if hdr_idx is None:
@@ -29,7 +27,7 @@ def _read_amz_unified_bytes(file_bytes: bytes) -> pd.DataFrame:
     return df
 
 def parse_paste(text: str) -> pd.DataFrame:
-    """Generic paste reader (CSV/TSV)."""
+    """Generic paste (used for inbound/tax)."""
     if not text or not text.strip():
         return pd.DataFrame()
     first = text.splitlines()[0]
@@ -37,33 +35,28 @@ def parse_paste(text: str) -> pd.DataFrame:
     return pd.read_csv(io.StringIO(text), sep=sep)
 
 def import_sales_csv(file_bytes: bytes, tz: str = 'UTC') -> int:
-    """
-    Import Amazon sales CSV (keep only Type=Order) into sales_txn.
-    Also dedup by deleting overlapping datetime range.
-    """
+    """Import Amazon monthly unified transactions; keep Type=Order; normalize marketplace; de-dup by time range."""
     df = _read_amz_unified_bytes(file_bytes)
 
     required = ['type','order id','sku','quantity']
-    miss = [c for c in required if c not in df.columns]
-    if miss:
-        raise ValueError(f"CSV missing column(s): {', '.join(miss)}")
+    missing = [c for c in required if c not in df.columns]
+    if missing:
+        raise ValueError(f"CSV missing column(s): {', '.join(missing)}")
 
-    # keep orders
     m_order = df['type'].astype(str).str.lower().str.contains(r'\border\b')
     df = df[m_order].copy()
     if df.empty:
         return 0
 
-    # datetime
     if 'date/time' in df.columns:
         dt_series = df['date/time'].astype(str)
     elif {'date','time'}.issubset(df.columns):
         dt_series = df['date'].astype(str) + ' ' + df['time'].astype(str)
     else:
-        raise ValueError("CSV must include 'date/time' or (date+time).")
+        raise ValueError("CSV must include 'date/time' or both 'date' and 'time'.")
+
     df['happened_at'] = pd.to_datetime(dt_series, errors='coerce', utc=True)
 
-    # normalize marketplace
     def norm_marketplace(s: str) -> str:
         s = (s or "").strip().lower()
         if "amazon.com" in s or s == "us": return "US"
@@ -83,12 +76,10 @@ def import_sales_csv(file_bytes: bytes, tz: str = 'UTC') -> int:
 
     out = df[['happened_at','type','order id','sku','marketplace','qty']].rename(columns={'order id':'order_id'})
 
-    # dedup range
     start = out['happened_at'].min()
     end = out['happened_at'].max() + pd.Timedelta(days=1)
     execute("delete from sales_txn where happened_at >= %s and happened_at < %s;", (start, end))
 
-    # bulk insert
     rows = list(out.itertuples(index=False, name=None))
     from db import get_conn
     import psycopg2.extras as extras
