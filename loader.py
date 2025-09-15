@@ -23,7 +23,7 @@ def import_sales_csv(file_bytes: bytes, tz: str = 'UTC'):
     if 'date/time' in df.columns:
         dtcol = 'date/time'
     elif 'date' in df.columns and 'time' in df.columns:
-        df['date/time'] = df['date'].astype(str) + ' ' + df['time'].astype(str)
+        df['date/time'] = df['date'].astype(str) + ' ' + df['time'].astype_str()
         dtcol = 'date/time'
     else:
         raise ValueError("CSV must include 'date/time' or 'date'+'time'.")
